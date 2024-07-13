@@ -3,19 +3,17 @@ from firebase_functions import firestore_fn, https_fn
 
 # The Firebase Admin SDK to access Cloud Firestore.
 from firebase_admin import initialize_app, firestore
-import google.cloud.firestore
 import os
 import datetime
 
 import google.generativeai as genai
-import vertexai
-from vertexai.preview import reasoning_engines
 from vertexai.generative_models import (
     FunctionDeclaration,
     GenerationConfig,
     GenerativeModel,
     Tool,
     Part,
+    Content,
 )
 
 app = initialize_app()
@@ -23,78 +21,6 @@ app = initialize_app()
 # db = firestore.client()
 
 AUTHOR_ID = "bcYT3imwF7QY6OdRnRyAY19K3Zz1"
-
-
-@https_fn.on_request()
-def addmessage(req: https_fn.Request) -> https_fn.Response:
-    """Take the text parameter passed to this HTTP endpoint and insert it into
-    a new document in the messages collection."""
-    # Grab the text parameter.
-    original = req.args.get("text")
-    if original is None:
-        return https_fn.Response("No text parameter provided", status=400)
-
-    firestore_client: google.cloud.firestore.Client = firestore.client()
-
-    # Push the new message into Cloud Firestore using the Firebase Admin SDK.
-    _, doc_ref = firestore_client.collection("messages").add({"original": original})
-
-    # Send back a message that we've successfully written the message
-    return https_fn.Response(f"Message with ID {doc_ref.id} added.")
-
-
-@firestore_fn.on_document_created(document="messages/{pushId}")
-def makeuppercase(
-    event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None],
-) -> None:
-    """Listens for new documents to be added to /messages. If the document has
-    an "original" field, creates an "uppercase" field containg the contents of
-    "original" in upper case."""
-
-    # Get the value of "original" if it exists.
-    if event.data is None:
-        return
-    try:
-        original = event.data.get("original")
-    except KeyError:
-        # No "original" field, so do nothing.
-        return
-
-    # Set the "uppercase" field.
-    print(f"Uppercasing {event.params['pushId']}: {original}")
-    upper = original.upper()
-    event.data.reference.update({"uppercase": upper})
-
-
-@firestore_fn.on_document_created(
-    document="messages/{pushId}", secrets=["GOOGLE_API_KEY"]
-)
-def makeaboutme(
-    event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None],
-) -> None:
-    """Listens for new documents to be added to /messages. If the document has
-    an "original" field, creates an "uppercase" field containg the contents of
-    "original" in upper case."""
-
-    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel("gemini-pro")
-
-    # Get the value of "original" if it exists.
-    if event.data is None:
-        return
-    try:
-        original = event.data.get("original")
-    except KeyError:
-        # No "original" field, so do nothing.
-        return
-
-    response = model.generate_content(
-        "Eres un asistente que ayuda a los usuarios de una aplicación de servicios a generar la descripción para su profile. Genera una descripción atractiva para las personas que requieren dicho servicio en no mas de 50 palabras basado en las siguientes características: "
-        + original
-    )
-
-    event.data.reference.update({"aboutme": response.text})
 
 
 @firestore_fn.on_document_created(
@@ -118,9 +44,37 @@ def chat_with_user(
         },
     )
 
-    yomap_tool = Tool(
-        function_declarations=[get_service_categories],
+    get_service_provider = FunctionDeclaration(
+        name="get_service_provider",
+        description="Get service providers based on the tags",
+        parameters={
+            "type": "object",
+            "properties": {
+                "tag": {
+                    "type": "string",
+                    "description": "the category of the service the user is looking for",
+                }
+            },
+        },
     )
+
+    yomap_tool = Tool(
+        function_declarations=[get_service_categories, get_service_provider],
+    )
+
+    def get_yomap_service_categories():
+        tags_ref = (
+            db.collection("tags")
+            # .where(filter=FieldFilter("active", "==", True))
+            # .where(filter=FieldFilter("rating", ">=", 3))
+        )
+        docs = tags_ref.limit_to_last(20).get()
+
+        tags = []
+        for doc in docs:
+            if "text" in doc.to_dict().keys():
+                tags.append(doc.to_dict()["text"])
+        return tags
 
     def get_service_categories_from_firebase():
         tags_ref = (
@@ -136,15 +90,37 @@ def chat_with_user(
                 tags.append(doc.to_dict()["name"])
         return tags
 
+    def get_service_provider_from_firebase(tag: str):
+        profile = db.collection("profiles")
+        print(tag)
+        docs = profile.where("service.text", "==", tag["tag"]).get()
+        return [doc.to_dict()["displayName"] for doc in docs]
+
     function_handler = {
-        "get_service_categories": get_service_categories_from_firebase,
+        "get_service_categories": get_yomap_service_categories,
+        "get_service_provider": get_service_provider_from_firebase,
     }
+
+    prompt = """Eres un asistente que responde cualquier pregunta que
+                te hagan los usuarios. Si la pregunta esta relacionada con
+                alguna de las tools disponibles, usa siempre la tool primero.
+                Caso contrario puedes responder usando tu propia informacion.
+                Cuando sea posible organiza la respuesta en bulletpoints."""
+
+    categories = get_yomap_service_categories()
+
+    prompt += (
+        """ Cuando el usuario pregunte por un servicio verifica primero si la categoria de servicio
+    solicitada esta en esta lista: """
+        + str(categories)
+        + ". En caso de que no este busca la categoria mas parecida"
+    )
 
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
     genai.configure(api_key=GOOGLE_API_KEY)
     model = GenerativeModel(
-        "gemini-1.5-pro-001",
-        generation_config=GenerationConfig(temperature=0),
+        model_name="gemini-1.5-pro-001",
+        system_instruction=prompt,
         tools=[yomap_tool],
     )
 
@@ -165,22 +141,29 @@ def chat_with_user(
             return
 
         if authorId != AUTHOR_ID:
-            chat = model.start_chat()
 
-            prompt = """Eres un asistente que responde cualquier pregunta que
-                te hagan los usuarios. Si la pregunta esta relacionada con
-                alguna de las tools disponibles, usa siempre la tool primero.
-                Caso contrario puedes responder usando tu propia informacion.
-                Cuando sea posible organiza la respuesta en bulletpoints.
-                Reponde la siguiente pregunta en no mas de 50 palabras de ser
-                posible: """
+            messages = db.collection("rooms").document(event.params["roomId"])
+            messages = messages.collection("messages")
+            docs = messages.limit_to_last(5).get()
+
+            history = []
+            for doc in docs:
+                if doc.to_dict()["authorId"] == AUTHOR_ID:
+                    role = "model"
+                else:
+                    role = "user"
+
+                history.append(
+                    Content(role=role, parts=[Part.from_text(doc.to_dict()["text"])])
+                )
+
+            print(history)
+            chat = model.start_chat()
 
             message = event.data.get("text")
 
-            prompt += message
-
             # Send a chat message to the Gemini API
-            response = chat.send_message(prompt)
+            response = chat.send_message(message)
 
             # Extract the function call response
             function_call = response.candidates[0].content.parts[0].function_call
@@ -196,6 +179,14 @@ def chat_with_user(
                 if function_name == "get_service_categories":
                     # Invoke a function that calls an external API
                     function_api_response = function_handler[function_name]()
+                else:
+                    # Extract the function call parameters
+                    params = {key: value for key, value in function_call.args.items()}
+
+                    # Invoke a function that calls an external API
+                    function_api_response = function_handler[function_name](params)[
+                        :20000
+                    ]  # Stay within the input token limit
 
                 # Send the API response back to Gemini, which will generate a natural language summary or another function call
                 response = chat.send_message(
