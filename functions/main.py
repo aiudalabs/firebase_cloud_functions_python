@@ -15,12 +15,40 @@ from vertexai.generative_models import (
     Part,
     Content,
 )
+from vertexai.preview.generative_models import ToolConfig
 
 app = initialize_app()
 
 # db = firestore.client()
 
 AUTHOR_ID = "bcYT3imwF7QY6OdRnRyAY19K3Zz1"
+
+PROMPT = """"
+    Welcome to YoMap! I am your virtual assistant, here to help you find the best service providers in your area. How can I assist you today?
+
+    Instructions for Chatbot Operation:
+
+        Language Detection and Switching:
+
+            Detect the user's preferred language at the beginning of the interaction and switch to that language for all subsequent communications.
+        
+        Information Provision:
+
+            Use the list of service {categories} to give detailed information when requested.
+        
+        Search and Matching:
+
+            Utilize the provided tools to search for service providers based on the user's specific needs.
+            Do not search in any other place, just use the tools.
+
+            Always use the tools to search by services, do not use any chat history to answer this kind of request.
+        
+        User-Friendly Interaction:
+
+            Maintain a conversational and friendly tone to ensure a pleasant user experience.
+            Prompt the user for additional information only if needed, request only the information needed to use the tools. 
+            Example: tag for get_service_provider tool
+"""
 
 
 @firestore_fn.on_document_created(
@@ -58,9 +86,43 @@ def chat_with_user(
         },
     )
 
-    yomap_tool = Tool(
-        function_declarations=[get_service_categories, get_service_provider],
+    get_profile_info = FunctionDeclaration(
+        name="get_profile_info",
+        description="Get profile info based on the name",
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "the name of the service provider",
+                }
+            },
+        },
     )
+
+    yomap_tool = Tool(
+        function_declarations=[
+            get_service_categories,
+            get_service_provider,
+            get_profile_info,
+        ],
+    )
+
+    def get_profile_info_from_firebase(name: str):
+        print(name["name"])
+        profile = db.collection("profiles")
+
+        docs = profile.where("displayName", "==", name["name"]).get()
+
+        user_profile = docs[0].to_dict()
+
+        if len(user_profile["location"]) > 0:
+            user_profile["location"] = {
+                "lat": docs[0].to_dict()["location"].latitude,
+                "long": docs[0].to_dict()["location"].longitude,
+            }
+
+        return user_profile
 
     def get_yomap_service_categories():
         tags_ref = (
@@ -100,6 +162,7 @@ def chat_with_user(
     function_handler = {
         "get_service_categories": get_yomap_service_categories,
         "get_service_provider": get_service_provider_from_firebase,
+        "get_profile_info": get_profile_info_from_firebase,
     }
 
     prompt = """Eres un asistente de un aplicacion de servicios. Tienes una base de datos
@@ -112,6 +175,12 @@ def chat_with_user(
 
     categories = get_yomap_service_categories()
 
+    # Create a formatted string of categories
+    formatted_categories = "\n".join([f"  - {category}" for category in categories])
+
+    # Replace the placeholder in the prompt template
+    final_prompt = PROMPT.format(categories=formatted_categories)
+
     prompt += (
         """ Cuando el usuario pregunte por un servicio verifica primero si la categoria de servicio
     solicitada esta en esta lista: """
@@ -120,12 +189,19 @@ def chat_with_user(
         Tus respuestas deben ser concisas."""
     )
 
+    tool_config = ToolConfig(
+        function_calling_config=ToolConfig.FunctionCallingConfig(
+            mode=ToolConfig.FunctionCallingConfig.Mode.AUTO,  # The default model behavior. The model decides whether to predict a function call or a natural language response.
+        )
+    )
+
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
     genai.configure(api_key=GOOGLE_API_KEY)
     model = GenerativeModel(
         model_name="gemini-1.5-pro-001",
-        system_instruction=prompt,
+        system_instruction=final_prompt,
         tools=[yomap_tool],
+        tool_config=tool_config,
     )
 
     # Get the room
@@ -202,9 +278,7 @@ def chat_with_user(
                     params = {key: value for key, value in function_call.args.items()}
 
                     # Invoke a function that calls an external API
-                    function_api_response = function_handler[function_name](params)[
-                        :20000
-                    ]  # Stay within the input token limit
+                    function_api_response = function_handler[function_name](params)
 
                 # Send the API response back to Gemini, which will generate a natural language summary or another function call
                 response = chat.send_message(
