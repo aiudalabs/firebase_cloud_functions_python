@@ -65,10 +65,11 @@ def chat_with_user(
     def get_yomap_service_categories():
         tags_ref = (
             db.collection("tags")
-            # .where(filter=FieldFilter("active", "==", True))
+            .where("usedBy", ">=", 1)
+            .order_by("usedBy")
             # .where(filter=FieldFilter("rating", ">=", 3))
         )
-        docs = tags_ref.limit_to_last(20).get()
+        docs = tags_ref.limit_to_last(100).get()
 
         tags = []
         for doc in docs:
@@ -101,11 +102,13 @@ def chat_with_user(
         "get_service_provider": get_service_provider_from_firebase,
     }
 
-    prompt = """Eres un asistente que responde cualquier pregunta que
-                te hagan los usuarios. Si la pregunta esta relacionada con
-                alguna de las tools disponibles, usa siempre la tool primero.
-                Caso contrario puedes responder usando tu propia informacion.
-                Cuando sea posible organiza la respuesta en bulletpoints."""
+    prompt = """Eres un asistente de un aplicacion de servicios. Tienes una base de datos
+                con categorias de servicios y proveedores de estos servicios. Cada vez que el
+                usuario pregunte por un servicio usa la herramienta correspondiente para buscar
+                el proveedor deseado. Nunca uses el historial de mensajes para responder a una
+                peticion de servicios, siempre usa una herramienta y busca en la base de datos.
+                
+                Organiza la respuesta en bulletpoints para facilitar la lectura."""
 
     categories = get_yomap_service_categories()
 
@@ -113,7 +116,8 @@ def chat_with_user(
         """ Cuando el usuario pregunte por un servicio verifica primero si la categoria de servicio
     solicitada esta en esta lista: """
         + str(categories)
-        + ". En caso de que no este busca la categoria mas parecida"
+        + """. En caso de que la categoria que busca no este, busca proveedores de alguna categoria similar. 
+        Tus respuestas deben ser concisas."""
     )
 
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
@@ -143,22 +147,36 @@ def chat_with_user(
         if authorId != AUTHOR_ID:
 
             messages = db.collection("rooms").document(event.params["roomId"])
-            messages = messages.collection("messages")
-            docs = messages.limit_to_last(5).get()
+            messages = messages.collection("messages").order_by(
+                "createdAt", direction=firestore.Query.ASCENDING
+            )
+            docs = messages.limit_to_last(20).get()
 
-            history = []
+            history_model = []
+            history_user = []
             for doc in docs:
                 if doc.to_dict()["authorId"] == AUTHOR_ID:
                     role = "model"
+                    history_model.append(
+                        Content(
+                            role=role, parts=[Part.from_text(doc.to_dict()["text"])]
+                        )
+                    )
                 else:
                     role = "user"
+                    history_user.append(
+                        Content(
+                            role=role, parts=[Part.from_text(doc.to_dict()["text"])]
+                        )
+                    )
 
-                history.append(
-                    Content(role=role, parts=[Part.from_text(doc.to_dict()["text"])])
-                )
+            history = []
+            for i in range(min(len(history_user), len(history_model))):
+                history.append(history_user[i])
+                history.append(history_model[i])
 
             print(history)
-            chat = model.start_chat()
+            chat = model.start_chat(history=history)
 
             message = event.data.get("text")
 
